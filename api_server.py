@@ -1,10 +1,12 @@
 import glob
 import json
+import logging
 import math
 import os
 import re
 import struct
 import sys
+import traceback
 
 import fiona
 import uvicorn
@@ -23,9 +25,21 @@ def get_resource_dir() -> str:
 
 def get_runtime_dir() -> str:
     """Return the directory that stores runtime-writable files."""
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
+    if not getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(__file__))
+
+    preferred_dir = os.path.dirname(sys.executable)
+    if os.access(preferred_dir, os.W_OK):
+        return preferred_dir
+
+    local_app_data = os.getenv("LOCALAPPDATA")
+    if local_app_data:
+        fallback_dir = os.path.join(local_app_data, "flood-api")
+    else:
+        fallback_dir = os.path.join(os.path.expanduser("~"), ".flood-api")
+
+    os.makedirs(fallback_dir, exist_ok=True)
+    return fallback_dir
 
 
 RESOURCE_DIR = get_resource_dir()
@@ -42,6 +56,73 @@ STATIONS_JSON_PATH = os.path.join(RUNTIME_DIR, "stations.json")
 STATION_INFO_DIR = os.path.join(RUNTIME_DIR, "stationInfo")
 os.makedirs(STATION_INFO_DIR, exist_ok=True)
 
+STARTUP_LOG_PATH = os.path.join(RUNTIME_DIR, "api_server_startup.log")
+ERROR_LOG_PATH = os.path.join(RUNTIME_DIR, "api_server_error.log")
+
+
+def configure_logging() -> logging.Logger:
+    """Configure logging for both console runs and packaged exe runs."""
+    logger = logging.getLogger("flood_api")
+    if logger.handlers:
+        return logger
+
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    file_handler = logging.FileHandler(STARTUP_LOG_PATH, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    logger.propagate = False
+    return logger
+
+
+LOGGER = configure_logging()
+
+
+def write_error_log(exc: Exception) -> None:
+    """Persist a full traceback so exe startup failures are diagnosable."""
+    with open(ERROR_LOG_PATH, "w", encoding="utf-8") as f:
+        f.write(traceback.format_exc())
+        f.write("\n")
+        f.write(f"exception_type={type(exc).__name__}\n")
+        f.write(f"resource_dir={RESOURCE_DIR}\n")
+        f.write(f"runtime_dir={RUNTIME_DIR}\n")
+        f.write(f"shp_path={SHP_PATH}\n")
+        f.write(f"dat_dir={DAT_DIR}\n")
+
+
+def validate_packaged_resources() -> None:
+    """Fail fast with actionable messages when bundled assets are missing."""
+    if not os.path.exists(SHP_PATH):
+        raise RuntimeError(
+            "找不到 SHP 文件。请确认打包时包含了 grid_outputs 目录，"
+            "并且 exe 输出目录中存在对应的网格资源。"
+            f" 当前路径: {SHP_PATH}"
+        )
+
+    if not os.path.exists(DAT_DIR):
+        raise RuntimeError(
+            "找不到 DAT 文件夹。请确认打包时包含了 grid_outputs 目录。"
+            f" 当前路径: {DAT_DIR}"
+        )
+
+    dat_candidates = glob.glob(os.path.join(DAT_DIR, "*.dat"))
+    if not dat_candidates:
+        raise RuntimeError(
+            "DAT 文件夹中没有找到任何 .dat 文件。请检查 --add-data 是否正确包含了时序数据文件。"
+        )
+
+
+def pause_before_exit() -> None:
+    """Keep the console open long enough for users to read startup errors."""
+    if getattr(sys, "frozen", False) and os.name == "nt":
+        os.system("pause")
+
 app = FastAPI(title="洪水水深时序查询 API (极速纯净版)", version="1.0")
 
 # 预加载到内存中的全局对象
@@ -57,10 +138,13 @@ async def load_data_on_startup():
     """在服务启动时，将数据预加载到内存中。"""
     global POLYGONS, GRID_IDS, SPATIAL_INDEX, TRANSFORMER, DAT_FILES
 
-    print("⏳ 正在启动服务，加载空间网格数据入内存...")
+    LOGGER.info("正在启动服务，加载空间网格数据入内存...")
+    LOGGER.info("RESOURCE_DIR=%s", RESOURCE_DIR)
+    LOGGER.info("RUNTIME_DIR=%s", RUNTIME_DIR)
+    LOGGER.info("SHP_PATH=%s", SHP_PATH)
+    LOGGER.info("DAT_DIR=%s", DAT_DIR)
 
-    if not os.path.exists(SHP_PATH):
-        raise RuntimeError(f"找不到 SHP 文件: {SHP_PATH}")
+    validate_packaged_resources()
 
     polygons = []
     grid_ids = []
@@ -69,10 +153,10 @@ async def load_data_on_startup():
     with fiona.open(SHP_PATH, "r") as src:
         shp_crs = src.crs
         if shp_crs:
-            print(f"🌍 检测到 SHP 坐标系: {shp_crs}，正在初始化坐标转换引擎...")
+            LOGGER.info("检测到 SHP 坐标系: %s，正在初始化坐标转换引擎...", shp_crs)
             transformer = Transformer.from_crs("EPSG:4326", shp_crs, always_xy=True)
 
-        print("🟩 正在解析几何网格并构建空间索引...")
+        LOGGER.info("正在解析几何网格并构建空间索引...")
         for feat in src:
             geom = shape(feat["geometry"])
             grid_id = feat["properties"].get("ID", feat["properties"].get("id"))
@@ -82,9 +166,6 @@ async def load_data_on_startup():
             polygons.append(geom)
             grid_ids.append(grid_id)
 
-    if not os.path.exists(DAT_DIR):
-        raise RuntimeError(f"找不到 DAT 文件夹: {DAT_DIR}")
-
     dat_files = sorted(glob.glob(os.path.join(DAT_DIR, "*.dat")))
 
     POLYGONS = polygons
@@ -93,9 +174,9 @@ async def load_data_on_startup():
     SPATIAL_INDEX = STRtree(POLYGONS)
     DAT_FILES = dat_files
 
-    print(f"✅ 空间索引构建完成！共包含 {len(POLYGONS)} 个网格。")
-    print(f"✅ DAT 扫描完成！共找到 {len(DAT_FILES)} 个历史时刻文件。")
-    print("🚀 服务启动完毕！请在浏览器访问 http://127.0.0.1:8000/docs 进行测试。")
+    LOGGER.info("空间索引构建完成，共包含 %s 个网格。", len(POLYGONS))
+    LOGGER.info("DAT 扫描完成，共找到 %s 个历史时刻文件。", len(DAT_FILES))
+    LOGGER.info("服务启动完毕，请在浏览器访问 http://127.0.0.1:8000/docs 进行测试。")
 
 
 @app.get("/api/get_depth_curve")
@@ -133,7 +214,7 @@ async def get_depth_curve(lon: float, lat: float):
             "data": None,
         }
 
-    print(f"📍 查询坐标 ({lon}, {lat}) -> 命中网格 ID: {matched_grid_id}")
+    LOGGER.info("查询坐标 (%s, %s) -> 命中网格 ID: %s", lon, lat, matched_grid_id)
 
     time_series_data = []
     record_size = 28
@@ -163,7 +244,7 @@ async def get_depth_curve(lon: float, lat: float):
                     }
                 )
         except Exception as exc:
-            print(f"读取文件 {filename} 失败: {exc}")
+            LOGGER.exception("读取文件 %s 失败: %s", filename, exc)
 
     return {
         "status": "success",
@@ -238,6 +319,19 @@ async def get_stations():
         }
 
 
+def run_server() -> None:
+    """Start the API server and persist startup failures to disk."""
+    try:
+        # 打包成 exe 后不要启用 reload，避免多进程重复启动。
+        uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
+    except Exception as exc:
+        write_error_log(exc)
+        LOGGER.exception("服务启动失败，详细堆栈已写入 %s", ERROR_LOG_PATH)
+        print(f"\n服务启动失败，详细错误已写入: {ERROR_LOG_PATH}")
+        print("常见原因：资源目录未打包、缺少 GIS 动态库、端口 8000 被占用。")
+        pause_before_exit()
+        raise
+
+
 if __name__ == "__main__":
-    # 打包成 exe 后不要启用 reload，避免多进程重复启动。
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
+    run_server()
